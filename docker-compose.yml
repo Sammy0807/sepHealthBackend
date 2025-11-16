@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  # Redis server for Bull Queue
+  redis:
+    image: redis:7-alpine
+    container_name: sephealth-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    networks:
+      - sephealth-network
+
+  # Push notification backend
+  push-backend:
+    build: .
+    container_name: sephealth-push-backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    depends_on:
+      - redis
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - PORT=3001
+      - MONGODB_URI=${MONGODB_URI}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - SEPHEALTH_API_URL=${SEPHEALTH_API_URL}
+      - CORS_ORIGIN=${CORS_ORIGIN}
+    networks:
+      - sephealth-network
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  redis_data:
+
+networks:
+  sephealth-network:
+    driver: bridge
