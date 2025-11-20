@@ -574,6 +574,200 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// Delete/Cancel a message
+app.delete('/api/push-messages/:messageId', async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    
+    // Validate messageId
+    if (!messageId || !mongoose.Types.ObjectId.isValid(messageId)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid message ID provided' 
+      });
+    }
+    
+    // Find the message
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Message not found' 
+      });
+    }
+    
+    // Check if message can be cancelled
+    const canCancel = ['Scheduled', 'Pending'].includes(message.status);
+    const isDelivered = ['Delivered', 'Sent'].includes(message.status);
+    
+    // Try to remove job from queue if it's scheduled
+    if (canCancel) {
+      try {
+        // Remove job from Bull queue
+        const job = await notificationQueue.getJob(messageId);
+        if (job) {
+          await job.remove();
+          console.log(`🗑️  Removed job ${messageId} from queue`);
+        }
+        
+        // Also try to find jobs with device-specific IDs (for immediate messages)
+        const devices = await Device.find({ isActive: true });
+        for (const device of devices) {
+          const deviceJobId = `${messageId}-${device._id}`;
+          const deviceJob = await notificationQueue.getJob(deviceJobId);
+          if (deviceJob) {
+            await deviceJob.remove();
+            console.log(`🗑️  Removed device job ${deviceJobId} from queue`);
+          }
+        }
+        
+        // Update message status to cancelled
+        message.status = 'Cancelled';
+        message.cancelledAt = new Date();
+        await message.save();
+        
+        console.log(`✅ Message cancelled: ${message.title}`);
+        
+        res.json({
+          success: true,
+          message: 'Message cancelled successfully',
+          data: {
+            messageId: message._id,
+            title: message.title,
+            status: message.status,
+            cancelledAt: message.cancelledAt
+          }
+        });
+        
+      } catch (queueError) {
+        console.error('❌ Error removing job from queue:', queueError);
+        
+        // Still update the message status even if queue removal fails
+        message.status = 'Cancelled';
+        message.cancelledAt = new Date();
+        await message.save();
+        
+        res.json({
+          success: true,
+          message: 'Message cancelled (queue removal failed but message marked as cancelled)',
+          warning: 'Job may still exist in queue',
+          data: {
+            messageId: message._id,
+            title: message.title,
+            status: message.status,
+            cancelledAt: message.cancelledAt
+          }
+        });
+      }
+      
+    } else if (isDelivered) {
+      // For delivered messages, just remove from database
+      await Message.findByIdAndDelete(messageId);
+      
+      console.log(`🗑️  Deleted delivered message: ${message.title}`);
+      
+      res.json({
+        success: true,
+        message: 'Delivered message deleted successfully',
+        data: {
+          messageId: messageId,
+          title: message.title,
+          wasDelivered: true
+        }
+      });
+      
+    } else {
+      // For failed or other status messages, just delete
+      await Message.findByIdAndDelete(messageId);
+      
+      console.log(`🗑️  Deleted message: ${message.title} (status: ${message.status})`);
+      
+      res.json({
+        success: true,
+        message: 'Message deleted successfully',
+        data: {
+          messageId: messageId,
+          title: message.title,
+          previousStatus: message.status
+        }
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Error deleting message:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// Bulk delete messages
+app.delete('/api/push-messages', async (req, res) => {
+  try {
+    const { messageIds, status, olderThan } = req.body;
+    
+    let deleteFilter = {};
+    
+    if (messageIds && Array.isArray(messageIds)) {
+      // Delete specific messages by IDs
+      deleteFilter._id = { $in: messageIds };
+    } else if (status) {
+      // Delete by status
+      deleteFilter.status = status;
+    } else if (olderThan) {
+      // Delete messages older than specified date
+      deleteFilter.createdAt = { $lt: new Date(olderThan) };
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: 'Must provide messageIds, status, or olderThan parameter'
+      });
+    }
+    
+    // Find messages to delete (for queue cleanup)
+    const messagesToDelete = await Message.find(deleteFilter);
+    
+    // Remove jobs from queue for scheduled messages
+    let queueJobsRemoved = 0;
+    for (const message of messagesToDelete) {
+      if (['Scheduled', 'Pending'].includes(message.status)) {
+        try {
+          const job = await notificationQueue.getJob(message._id.toString());
+          if (job) {
+            await job.remove();
+            queueJobsRemoved++;
+          }
+        } catch (queueError) {
+          console.warn(`⚠️  Could not remove job ${message._id} from queue:`, queueError.message);
+        }
+      }
+    }
+    
+    // Delete messages from database
+    const deleteResult = await Message.deleteMany(deleteFilter);
+    
+    console.log(`🗑️  Bulk deleted ${deleteResult.deletedCount} messages, removed ${queueJobsRemoved} queue jobs`);
+    
+    res.json({
+      success: true,
+      message: `Successfully deleted ${deleteResult.deletedCount} messages`,
+      data: {
+        deletedCount: deleteResult.deletedCount,
+        queueJobsRemoved: queueJobsRemoved,
+        filter: deleteFilter
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error bulk deleting messages:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Push notification server running on http://0.0.0.0:${PORT}`);
