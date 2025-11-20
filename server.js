@@ -768,6 +768,18 @@ app.delete('/api/push-messages', async (req, res) => {
   }
 });
 
+// Keep-alive ping (prevents server sleep on free tier)
+if (process.env.NODE_ENV === 'production') {
+  setInterval(async () => {
+    try {
+      await fetch('https://sephealthbackend.onrender.com/api/health');
+      console.log('⏰ Keep-alive ping sent');
+    } catch (error) {
+      console.error('Keep-alive ping failed:', error.message);
+    }
+  }, 14 * 60 * 1000); // Ping every 14 minutes
+}
+
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Push notification server running on http://0.0.0.0:${PORT}`);
