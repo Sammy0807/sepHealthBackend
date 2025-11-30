@@ -189,31 +189,247 @@ app.post('/api/device/register', async (req, res) => {
   }
 });
 
-// Get all messages
+// Create and schedule message
+app.post('/api/push-messages', async (req, res) => {
+  try {
+    const messageData = req.body;
+    console.log("Scheduled date and time (CST):", messageData.scheduledDateTime);
+    
+    // Validate required fields
+    if (!messageData.title || !messageData.body || !messageData.scheduledDateTime) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Missing required fields: title, body, scheduledDateTime' 
+      });
+    }
+    
+    // Convert and validate scheduled datetime
+    const cstConversion = convertToCST(messageData.scheduledDateTime);
+    
+    if (!cstConversion.isValid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid datetime format',
+        details: cstConversion.error,
+        hint: 'Use ISO format: YYYY-MM-DDTHH:mm:ss (will be treated as CST time)'
+      });
+    }
+    
+    const scheduledTime = cstConversion.utcDate; // This is the CST time the user entered
+    const now = new Date();
+    const delay = scheduledTime - now;
+    
+    
+    // Validate scheduled time is in the future
+    if (delay < -5000) {
+      return res.status(400).json({
+        success: false,
+        error: 'Scheduled time must be in the future',
+        details: {
+          scheduled: cstConversion.cstString,
+          current: now.toLocaleString('en-US', { timeZone: 'America/Chicago' })
+        }
+      });
+    }
+    
+    // Find device(s) to send to
+    let devices;
+    if (messageData.deviceId) {
+      devices = await Device.find({ _id: messageData.deviceId });
+    } else {
+      devices = await Device.find({ isActive: true });
+    }
+    
+    if (devices.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'No active devices found' 
+      });
+    }
+    
+    const results = [];
+    
+    // Create ONE message record (not one per device)
+    const message = new Message({
+      title: messageData.title,
+      content: messageData.body,
+      scheduledDateTime: scheduledTime, // Store the time as-is
+      status: 'Scheduled',
+      category: messageData.category || 'Health Tip',
+      priority: messageData.priority || 'normal',
+      targetAudience: messageData.targetAudience || ['All Users'],
+      createdBy: messageData.createdBy || 'System'
+    });
+    
+    await message.save();
+    
+    // Create job for each device
+    for (const device of devices) {
+      const effectiveDelay = delay < 30000 ? 30000 : delay;
+      
+      const job = await notificationQueue.add(
+        { message: message.toObject() },
+        {
+          delay: effectiveDelay,
+          jobId: `${message._id}-${device._id}`,
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 2000
+          },
+          removeOnComplete: false,
+          removeOnFail: false
+        }
+      );
+      
+      results.push({
+        messageId: message._id,
+        jobId: job.id,
+        deviceId: device._id,
+        scheduledTime: formatDateTime(scheduledTime)
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      messageId: message._id,
+      results,
+      message: `Created 1 message, scheduled for ${results.length} device(s)`,
+      scheduledTime: formatDateTime(scheduledTime)
+    });
+    
+  } catch (error) {
+    console.error('❌ Message scheduling error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// Send immediate message
+app.post('/api/push-messages/immediate', async (req, res) => {
+  try {
+    const messageData = req.body;
+    
+    // Validate required fields
+    if (!messageData.title || !messageData.body) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Missing required fields: title, body' 
+      });
+    }
+    
+    // Find device(s) to send to
+    let devices;
+    if (messageData.deviceId) {
+      devices = await Device.find({ _id: messageData.deviceId });
+    } else {
+      devices = await Device.find({ isActive: true });
+    }
+    
+    if (devices.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'No active devices found' 
+      });
+    }
+    
+    // Create ONE message record
+    const now = new Date();
+    const message = new Message({
+      title: messageData.title,
+      content: messageData.body,
+      scheduledDateTime: now,
+      status: 'Scheduled',
+      category: messageData.category === 'Test' ? 'Health Tip' : (messageData.category || 'Health Tip'),
+      priority: messageData.priority || 'normal',
+      targetAudience: messageData.targetAudience || ['All Users'],
+      createdBy: messageData.createdBy || 'System'
+    });
+    
+    await message.save();
+    
+    const results = [];
+    
+    // Send to each device
+    for (const device of devices) {
+      const job = await notificationQueue.add(
+        { 
+          message: {
+            ...message.toObject(),
+            deviceId: device._id
+          }
+        },
+        {
+          delay: 5000,
+          jobId: `${message._id}-${device._id}`,
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 2000
+          }
+        }
+      );
+      
+      results.push({
+        messageId: message._id,
+        jobId: job.id,
+        deviceId: device._id
+      });
+    }
+    
+    console.log(`✅ Immediate message created: ${message.title}`);
+    console.log(`📱 Queued for ${results.length} device(s) at ${formatDateTime(now).cst}`);
+    
+    res.json({ 
+      success: true, 
+      messageId: message._id,
+      results,
+      message: `Created 1 message, queued for ${results.length} device(s)`,
+      sentTime: formatDateTime(now)
+    });
+    
+  } catch (error) {
+    console.error('❌ Immediate message error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// Get all messages (with CST times)
 app.get('/api/push-messages', async (req, res) => {
   try {
     const { status, limit = 50, skip = 0 } = req.query;
     
-    // Build query filter
     let filter = {};
     if (status) {
       filter.status = status;
     }
     
-    // Get messages from database with optional filtering
     const messages = await Message.find(filter)
-      .sort({ createdAt: -1 }) // Most recent first
+      .sort({ createdAt: -1 })
       .limit(parseInt(limit))
       .skip(parseInt(skip));
 
-    // Count total messages for pagination
     const totalMessages = await Message.countDocuments(filter);
     
-    console.log(`📥 Retrieved ${messages.length} messages from database (total: ${totalMessages})`);
+    // Format messages with CST times
+    const formattedMessages = messages.map(msg => ({
+      ...msg.toObject(),
+      scheduledDateTime: formatDateTime(msg.scheduledDateTime),
+      createdAt: formatDateTime(msg.createdAt),
+      ...(msg.cancelledAt && { cancelledAt: formatDateTime(msg.cancelledAt) }),
+      ...(msg.deliveredAt && { deliveredAt: formatDateTime(msg.deliveredAt) })
+    }));
+    
+    console.log(`📥 Retrieved ${messages.length} messages (total: ${totalMessages})`);
     
     res.json({
       success: true,
-      data: messages,
+      data: formattedMessages,
       pagination: {
         total: totalMessages,
         limit: parseInt(limit),
@@ -231,183 +447,30 @@ app.get('/api/push-messages', async (req, res) => {
   }
 });
 
-// Create and schedule message
-app.post('/api/push-messages', async (req, res) => {
+// Get all devices (with CST times)
+app.get('/api/devices', async (req, res) => {
   try {
-    const messageData = req.body;
+    const devices = await Device.find({})
+      .sort({ lastActive: -1 })
+      .select('pushToken platform lastActive isActive createdAt');
     
-    // Validate required fields
-    if (!messageData.title || !messageData.body || !messageData.scheduledDateTime) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: title, body, scheduledDateTime' 
-      });
-    }
+    const formattedDevices = devices.map(device => ({
+      id: device._id,
+      pushToken: device.pushToken.substring(0, 20) + '...',
+      platform: device.platform,
+      lastActive: formatDateTime(device.lastActive),
+      isActive: device.isActive,
+      createdAt: formatDateTime(device.createdAt)
+    }));
     
-    // Find device(s) to send to
-    let devices;
-    if (messageData.deviceId) {
-      devices = await Device.find({ _id: messageData.deviceId });
-    } else {
-      // Send to all devices if no specific device
-      devices = await Device.find({ isActive: true });
-    }
-    
-    if (devices.length === 0) {
-      return res.status(404).json({ error: 'No active devices found' });
-    }
-    
-    const results = [];
-    
-    // Create message for each device
-    for (const device of devices) {
-      // Create message record
-      const message = new Message({
-        title: messageData.title,
-        content: messageData.body, // Use 'content' field as required by schema
-        scheduledDateTime: new Date(messageData.scheduledDateTime),
-        status: 'Scheduled',
-        category: messageData.category || 'Health Tip',
-        priority: messageData.priority || 'normal',
-        targetAudience: messageData.targetAudience || ['All Users'],
-        createdBy: messageData.createdBy || 'System'
-      });
-      
-      await message.save();
-      
-      const scheduledTime = new Date(messageData.scheduledDateTime);
-      const now = new Date();
-      const delay = scheduledTime - now;
-      
-      console.log('🕐 Time validation:');
-      console.log('  Scheduled time:', scheduledTime.toISOString());
-      console.log('  Current time:', now.toISOString());
-      console.log('  Delay (ms):', delay);
-      console.log('  Delay (seconds):', Math.round(delay / 1000));
-      
-      // Allow a small buffer for network latency (5 seconds)
-      if (delay < -5000) {
-        return res.status(400).json({
-          success: false,
-          error: `Scheduled time must be in the future. Received: ${scheduledTime.toLocaleString()}, Current: ${now.toLocaleString()}`
-        });
-      }
-      
-      // If the time is very close (within 30 seconds), schedule it for 30 seconds from now
-      const effectiveDelay = delay < 30000 ? 30000 : delay;
-      
-      // Add job to queue
-      const job = await notificationQueue.add(
-        { message: message.toObject() },
-        {
-          delay: effectiveDelay,
-          jobId: message._id.toString(), // Use message ID as job ID
-          attempts: 3,
-          backoff: {
-            type: 'exponential',
-            delay: 2000
-          },
-          removeOnComplete: false,
-          removeOnFail: false
-        }
-      );
-    
-      results.push({
-        messageId: message._id,
-        jobId: job.id,
-        deviceId: device._id,
-        scheduledTime: scheduledTime.toISOString()
-      });
-    }
-    
-    res.json({ 
-      success: true, 
-      results,
-      message: `Scheduled ${results.length} notification(s)`
+    res.json({
+      success: true,
+      devices: formattedDevices,
+      total: devices.length
     });
     
   } catch (error) {
-    console.error('❌ Message scheduling error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Send immediate message (creates only ONE message record, sends to all devices)
-app.post('/api/push-messages/immediate', async (req, res) => {
-  try {
-    const messageData = req.body;
-    
-    // Validate required fields
-    if (!messageData.title || !messageData.body) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: title, body' 
-      });
-    }
-    
-    // Find device(s) to send to
-    let devices;
-    if (messageData.deviceId) {
-      devices = await Device.find({ _id: messageData.deviceId });
-    } else {
-      devices = await Device.find({ isActive: true });
-    }
-    
-    if (devices.length === 0) {
-      return res.status(404).json({ error: 'No active devices found' });
-    }
-    
-    // Create ONE message record (not one per device)
-    const message = new Message({
-      title: messageData.title,
-      content: messageData.body, // Use 'content' field as required by schema
-      scheduledDateTime: new Date(),
-      status: 'Scheduled', // Use valid enum value
-      category: messageData.category === 'Test' ? 'Health Tip' : (messageData.category || 'Health Tip'), // Map 'Test' to valid enum
-      priority: messageData.priority || 'normal',
-      targetAudience: messageData.targetAudience || ['All Users'],
-      createdBy: messageData.createdBy || 'System'
-    });
-    
-    await message.save();
-    
-    const results = [];
-    
-    // Send to each device but don't create separate message records
-    for (const device of devices) {
-      // Add job to queue with minimal delay (5 seconds)
-      const job = await notificationQueue.add(
-        { 
-          message: {
-            ...message.toObject(),
-            deviceId: device._id // Add device ID for processing
-          }
-        },
-        {
-          delay: 5000, // 5 second delay for immediate messages
-          jobId: `${message._id}-${device._id}`, // Unique job ID per device
-          attempts: 3,
-          backoff: {
-            type: 'exponential',
-            delay: 2000
-          }
-        }
-      );
-            
-      results.push({
-        messageId: message._id,
-        jobId: job.id,
-        deviceId: device._id
-      });
-    }
-    
-    res.json({ 
-      success: true, 
-      messageId: message._id, // Single message ID
-      results,
-      message: `Created 1 message, queued for ${results.length} device(s)`
-    });
-    
-  } catch (error) {
-    console.error('❌ Immediate message error:', error);
+    console.error('❌ Error fetching devices:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -439,32 +502,6 @@ app.get('/api/push-messages/stats', async (req, res) => {
     
   } catch (error) {
     console.error('❌ Stats error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get all devices
-app.get('/api/devices', async (req, res) => {
-  try {
-    const devices = await Device.find({})
-      .sort({ lastActive: -1 })
-      .select('pushToken platform lastActive isActive createdAt');
-        
-    res.json({
-      success: true,
-      devices: devices.map(device => ({
-        id: device._id,
-        pushToken: device.pushToken.substring(0, 20) + '...',
-        platform: device.platform,
-        lastActive: device.lastActive,
-        isActive: device.isActive,
-        createdAt: device.createdAt
-      })),
-      total: devices.length
-    });
-    
-  } catch (error) {
-    console.error('❌ Error fetching devices:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -532,13 +569,11 @@ app.delete('/api/devices/all', async (req, res) => {
   }
 });
 
-// Health check
+// Health check (with CST times)
 app.get('/api/health', async (req, res) => {
   try {
-    // Check MongoDB connection
     const mongoStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
     
-    // Check Redis connection
     let redisStatus = 'disconnected';
     let queueStats = '0 jobs waiting';
     try {
@@ -554,7 +589,7 @@ app.get('/api/health', async (req, res) => {
     
     res.status(isHealthy ? 200 : 503).json({
       status: isHealthy ? 'healthy' : 'unhealthy',
-      timestamp: new Date().toISOString(),
+      timestamp: formatDateTime(new Date()),
       server: 'Bull Queue Push Notification Server',
       version: '1.0.0',
       services: {
@@ -569,7 +604,7 @@ app.get('/api/health', async (req, res) => {
     res.status(500).json({
       status: 'unhealthy',
       error: error.message,
-      timestamp: new Date().toISOString()
+      timestamp: formatDateTime(new Date())
     });
   }
 });
@@ -767,6 +802,99 @@ app.delete('/api/push-messages', async (req, res) => {
     });
   }
 });
+
+// ===========================================
+// UTILITY FUNCTIONS
+// ===========================================
+
+/**
+ * Convert a datetime string to UTC for storage
+ * Assumes input without timezone info is in CST
+ * @param {string} dateTimeString - ISO datetime string (assumed CST if no timezone)
+ * @returns {object} { utcDate, cstString }
+ */
+function convertToCST(dateTimeString) {
+  try {
+    // Parse the input datetime
+    let inputDate = new Date(dateTimeString);
+    
+    // Check if the input string has timezone info (Z, +, or -)
+    const hasTimezone = /Z$|[+-]\d{2}:\d{2}$|[+-]\d{4}$/.test(dateTimeString.trim());
+    
+    // If no timezone info, assume it's already in CST
+    // Store it as-is (it's already in the correct timezone)
+    if (!hasTimezone) {
+      // The user entered a CST time, store it as CST time
+      // No conversion needed - just store what the user entered
+      const cstString = inputDate.toLocaleString('en-US', {
+        timeZone: 'America/Chicago',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      });
+      
+      return {
+        utcDate: inputDate, // Store the time as-is (user's CST time)
+        cstString: cstString,
+        isValid: true
+      };
+    }
+    
+    // If timezone info exists, use it as-is
+    const cstString = inputDate.toLocaleString('en-US', {
+      timeZone: 'America/Chicago',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+    
+    return {
+      utcDate: inputDate,
+      cstString: cstString,
+      isValid: true
+    };
+  } catch (error) {
+    return {
+      isValid: false,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Format datetime for API responses (display as CST)
+ * @param {Date} date - Date object to format
+ * @returns {object} { utc, cst }
+ */
+function formatDateTime(date) {
+  // Display the stored time in both formats
+  const utcString = date.toISOString();
+  
+  // Since we're storing CST times, display them as CST
+  const cstString = date.toLocaleString('en-US', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  });
+  
+  return {
+    utc: utcString,
+    cst: cstString
+  };
+}
 
 // Keep-alive ping (prevents server sleep on free tier)
 if (process.env.NODE_ENV === 'production') {
