@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "scheduler": "node scheduler.js"
+    "scheduler": "node scheduler.js",
+    "seed": "node seed.js"
   },
   "dependencies": {
     "bull": "^4.11.5",
@@ -14,11 +15,13 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "mongoose": "^8.0.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "socket.io": "^4.8.1"
   },
   "devDependencies": {
     "axios": "^1.13.2",
     "expo-server-sdk": "^4.0.0",
+    "migrate-mongo": "^14.0.7",
     "nodemon": "^3.0.1"
   },
   "engines": {
